@@ -81,18 +81,27 @@ def read_live_sessions(since_date: date) -> dict:
 
                 day = ts[:10]
                 if day not in daily:
-                    daily[day] = {"messageCount": 0, "toolCallCount": 0, "sessions": set()}
+                    daily[day] = {
+                        "messageCount": 0, "toolCallCount": 0, "sessions": set(),
+                        "inputTokens": 0, "outputTokens": 0, "cacheReadTokens": 0,
+                    }
 
                 t = obj.get("type", "")
                 if t == "user":
                     daily[day]["messageCount"] += 1
                 elif t == "assistant":
+                    msg = obj.get("message", {})
                     # Tool uses are nested inside assistant message content
-                    content = obj.get("message", {}).get("content", [])
+                    content = msg.get("content", [])
                     if isinstance(content, list):
                         for block in content:
                             if isinstance(block, dict) and block.get("type") == "tool_use":
                                 daily[day]["toolCallCount"] += 1
+                    # Token usage
+                    usage = msg.get("usage", {})
+                    daily[day]["inputTokens"] += usage.get("input_tokens", 0)
+                    daily[day]["outputTokens"] += usage.get("output_tokens", 0)
+                    daily[day]["cacheReadTokens"] += usage.get("cache_read_input_tokens", 0)
 
                 if not is_subagent:
                     sid = obj.get("sessionId")
@@ -107,6 +116,9 @@ def read_live_sessions(since_date: date) -> dict:
             "messageCount": v["messageCount"],
             "toolCallCount": v["toolCallCount"],
             "sessionCount": len(v["sessions"]),
+            "inputTokens": v["inputTokens"],
+            "outputTokens": v["outputTokens"],
+            "cacheReadTokens": v["cacheReadTokens"],
         }
         for day, v in daily.items()
     }
@@ -156,12 +168,6 @@ def load_stats() -> dict | None:
     peak_hour = max(hour_counts, key=hour_counts.get) if hour_counts else None
     peak_count = hour_counts.get(peak_hour, 0) if peak_hour is not None else 0
 
-    last_computed = raw.get("lastComputedDate", "")
-    try:
-        stale_days = (date.today() - date.fromisoformat(last_computed)).days
-    except ValueError:
-        stale_days = 0
-
     first_dt = raw.get("firstSessionDate", "")
     try:
         first_date = datetime.fromisoformat(first_dt.replace("Z", "+00:00")).date()
@@ -185,8 +191,6 @@ def load_stats() -> dict | None:
         "longest_ms": ls.get("duration", 0),
         "longest_msgs": ls.get("messageCount", 0),
         "first_date": first_date,
-        "stale_days": stale_days,
-        "last_computed": last_computed,
     }
 
 
@@ -196,13 +200,10 @@ def build_title(stats: dict | None) -> str:
     if stats is None:
         return "◆ ––"
     t = stats["today"]
-    msgs = t["messageCount"]
-    tools = t["toolCallCount"]
-    if msgs == 0:
-        return "◆ 0m"
-    if tools > 0:
-        return f"◆ {msgs}m {tools}t"
-    return f"◆ {msgs}m"
+    total_tokens = t.get("inputTokens", 0) + t.get("outputTokens", 0)
+    if total_tokens == 0:
+        return "◆ 0"
+    return f"◆ {fmt_tokens(total_tokens)}"
 
 
 def build_menu_items(stats: dict | None) -> list:
@@ -218,19 +219,28 @@ def build_menu_items(stats: dict | None) -> list:
 
     # ── TODAY ──────────────────────────────────────────────────────────────────
     items.append(rumps.MenuItem(f"TODAY  ({today_str})"))
-    items.append(rumps.MenuItem(f"  Messages:    {t['messageCount']}"))
-    items.append(rumps.MenuItem(f"  Tool Calls:  {t['toolCallCount']}"))
-    items.append(rumps.MenuItem(f"  Sessions:    {t['sessionCount']}"))
+    items.append(rumps.MenuItem(f"  Messages:       {t['messageCount']}"))
+    items.append(rumps.MenuItem(f"  Tool Calls:     {t['toolCallCount']}"))
+    items.append(rumps.MenuItem(f"  Sessions:       {t['sessionCount']}"))
+    items.append(rumps.MenuItem(f"  Input Tokens:   {fmt_tokens(t.get('inputTokens', 0))}"))
+    items.append(rumps.MenuItem(f"  Output Tokens:  {fmt_tokens(t.get('outputTokens', 0))}"))
+    items.append(rumps.MenuItem(f"  Cache Read:     {fmt_tokens(t.get('cacheReadTokens', 0))}"))
     items.append(None)
 
     # ── THIS WEEK ──────────────────────────────────────────────────────────────
     week_start = (date.today() - timedelta(days=6)).strftime("%b %d")
     week_end = date.today().strftime("%b %d")
     active_days = len(stats["week_entries"])
+    week_input = sum(e.get("inputTokens", 0) for e in stats["week_entries"])
+    week_output = sum(e.get("outputTokens", 0) for e in stats["week_entries"])
+    week_cache = sum(e.get("cacheReadTokens", 0) for e in stats["week_entries"])
     items.append(rumps.MenuItem(f"THIS WEEK  ({week_start} \u2013 {week_end})"))
-    items.append(rumps.MenuItem(f"  Messages:    {stats['week_msgs']}"))
-    items.append(rumps.MenuItem(f"  Tool Calls:  {stats['week_tools']}"))
-    items.append(rumps.MenuItem(f"  Active days: {active_days} of 7"))
+    items.append(rumps.MenuItem(f"  Messages:       {stats['week_msgs']}"))
+    items.append(rumps.MenuItem(f"  Tool Calls:     {stats['week_tools']}"))
+    items.append(rumps.MenuItem(f"  Active days:    {active_days} of 7"))
+    items.append(rumps.MenuItem(f"  Input Tokens:   {fmt_tokens(week_input)}"))
+    items.append(rumps.MenuItem(f"  Output Tokens:  {fmt_tokens(week_output)}"))
+    items.append(rumps.MenuItem(f"  Cache Read:     {fmt_tokens(week_cache)}"))
     items.append(None)
 
     # ── ALL TIME ───────────────────────────────────────────────────────────────
@@ -260,11 +270,8 @@ def build_menu_items(stats: dict | None) -> list:
     items.append(None)
 
     # ── STATUS ─────────────────────────────────────────────────────────────────
-    stale = stats["stale_days"]
-    stale_label = f"  Last updated: {stats['last_computed']}"
-    if stale >= 1:
-        stale_label += f"  \u26a0 {stale}d ago"
-    items.append(rumps.MenuItem(stale_label))
+    now_str = datetime.now().strftime("%H:%M")
+    items.append(rumps.MenuItem(f"  Last refresh: {now_str}"))
 
     return items
 
